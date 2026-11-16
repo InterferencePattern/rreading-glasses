@@ -26,6 +26,9 @@ const (
 	_purgeInterval    = time.Hour
 	_purgeGracePeriod = 30 * 24 * time.Hour
 	_purgeBatchSize   = 10_000
+	// _purgeBatchPause spaces out batches so working through a large backlog
+	// doesn't monopolize disk I/O.
+	_purgeBatchPause = time.Second
 )
 
 // _buffers reduces GC.
@@ -175,6 +178,12 @@ func (pg *pgcache) purgeExpired(ctx context.Context) (int64, error) {
 		total += tag.RowsAffected()
 		if tag.RowsAffected() < _purgeBatchSize {
 			return total, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(_purgeBatchPause):
 		}
 	}
 }
