@@ -3,14 +3,15 @@ package internal
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/IBM/pgxpoolprometheus"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -60,8 +61,23 @@ type cloudflareMetrics struct {
 }
 
 type dbMetrics struct {
-	dirty atomic.Bool // dirty signals that the DB has been modified so stats should be collected.
 	gauge *prometheus.GaugeVec
+}
+
+// dbStats counts persisted objects by type.
+type dbStats struct {
+	authors, editions, works, refreshing, series, asin, isbn int64
+}
+
+// _dbStatsSampleBytes bounds how much of the cache table we read when
+// collecting stats. Tables smaller than this are counted exactly; larger ones
+// are estimated from a random sample of about this many bytes, so the cost of
+// collection doesn't grow with the table.
+const _dbStatsSampleBytes = 16 << 20
+
+// rowQuerier is satisfied by both connection pools and transactions.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // instrument wraps an HTTP handler to automatically record timing and status
@@ -225,42 +241,78 @@ func newDBMetrics(db *pgxpool.Pool, reg *prometheus.Registry) *dbMetrics {
 		reg.MustRegister(gauge, pgxpoolprometheus.NewCollector(db, nil))
 	}
 	dbm := &dbMetrics{gauge: gauge}
-	// This is an expensive query so we only run it every 5 minutes,
-	// and only if there's been some DB activity that changed the
-	// relevant stats.
-	dbm.dirty.Store(true) // Start dirty to trigger an initial query.
 	go func() {
 		ctx := context.Background()
 		for {
-			row := db.QueryRow(ctx, `
-			  SELECT
-				sum(CASE WHEN key LIKE 'a%'  THEN 1 ELSE 0 END) AS authors,
-				sum(CASE WHEN key LIKE 'b%'  THEN 1 ELSE 0 END) AS editions,
-				sum(CASE WHEN key LIKE 'w%'  THEN 1 ELSE 0 END) AS works,
-				sum(CASE WHEN key LIKE 'ra%' THEN 1 ELSE 0 END) AS refreshing,
-				sum(CASE WHEN key LIKE 's%'  THEN 1 ELSE 0 END) AS seriess,
-				sum(CASE WHEN key LIKE 'z%'  THEN 1 ELSE 0 END) AS asin,
-				sum(CASE WHEN key LIKE 'i%'  THEN 1 ELSE 0 END) AS isbn
-			  FROM cache;
-			`)
-			var authors, editions, works, refreshing, series, asin, isbn int64
-			err := row.Scan(&authors, &editions, &works, &refreshing, &series, &asin, &isbn)
+			stats, err := collectDBStats(ctx, db, _dbStatsSampleBytes)
 			if err != nil {
 				Log(ctx).Warn("problem collecting db stats", "err", err)
 			} else {
-				dbm.authorsSet(authors)
-				dbm.editionsSet(editions)
-				dbm.worksSet(works)
-				dbm.refreshingSet(refreshing)
-				dbm.seriesSet(series)
-				dbm.asinSet(asin)
-				dbm.isbnSet(isbn)
+				dbm.authorsSet(stats.authors)
+				dbm.editionsSet(stats.editions)
+				dbm.worksSet(stats.works)
+				dbm.refreshingSet(stats.refreshing)
+				dbm.seriesSet(stats.series)
+				dbm.asinSet(stats.asin)
+				dbm.isbnSet(stats.isbn)
 			}
-			dbm.dirty.Store(false)
 			time.Sleep(5 * time.Minute)
 		}
 	}()
-	return &dbMetrics{gauge: gauge}
+	return dbm
+}
+
+// collectDBStats counts cached objects by type.
+//
+// Counting requires reading every row, which gets very expensive once the
+// table is large. To keep the cost bounded we read at most ~sampleBytes of the
+// table: small tables are read completely and yield exact counts, while larger
+// tables are sampled by block and the counts are scaled up to an estimate.
+func collectDBStats(ctx context.Context, db rowQuerier, sampleBytes int64) (dbStats, error) {
+	var size int64
+	err := db.QueryRow(ctx, `SELECT pg_relation_size('cache');`).Scan(&size)
+	if err != nil {
+		return dbStats{}, fmt.Errorf("getting table size: %w", err)
+	}
+
+	percent := 100.0
+	if size > sampleBytes && sampleBytes > 0 {
+		percent = 100.0 * float64(sampleBytes) / float64(size)
+	}
+
+	// SYSTEM sampling picks whole blocks, so it only reads the fraction of the
+	// table we ask for. At 100% it's equivalent to a regular scan.
+	row := db.QueryRow(ctx, `
+	  SELECT
+		COALESCE(sum(CASE WHEN key LIKE 'a%'  THEN 1 ELSE 0 END), 0) AS authors,
+		COALESCE(sum(CASE WHEN key LIKE 'b%'  THEN 1 ELSE 0 END), 0) AS editions,
+		COALESCE(sum(CASE WHEN key LIKE 'w%'  THEN 1 ELSE 0 END), 0) AS works,
+		COALESCE(sum(CASE WHEN key LIKE 'ra%' THEN 1 ELSE 0 END), 0) AS refreshing,
+		COALESCE(sum(CASE WHEN key LIKE 's%'  THEN 1 ELSE 0 END), 0) AS seriess,
+		COALESCE(sum(CASE WHEN key LIKE 'z%'  THEN 1 ELSE 0 END), 0) AS asin,
+		COALESCE(sum(CASE WHEN key LIKE 'i%'  THEN 1 ELSE 0 END), 0) AS isbn
+	  FROM cache TABLESAMPLE SYSTEM ($1);
+	`, percent)
+
+	var s dbStats
+	err = row.Scan(&s.authors, &s.editions, &s.works, &s.refreshing, &s.series, &s.asin, &s.isbn)
+	if err != nil {
+		return dbStats{}, fmt.Errorf("counting rows: %w", err)
+	}
+
+	scale := func(n int64) int64 {
+		return int64(math.Round(float64(n) * 100.0 / percent))
+	}
+
+	return dbStats{
+		authors:    scale(s.authors),
+		editions:   scale(s.editions),
+		works:      scale(s.works),
+		refreshing: scale(s.refreshing),
+		series:     scale(s.series),
+		asin:       scale(s.asin),
+		isbn:       scale(s.isbn),
+	}, nil
 }
 
 func (dbm *dbMetrics) authorsSet(n int64) {
